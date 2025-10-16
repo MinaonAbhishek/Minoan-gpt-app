@@ -1,14 +1,12 @@
 # Minoan - AI-Powered Furniture Shopping
 
-Minoan is a shopping application that runs inside ChatGPT via the Model Context Protocol (MCP). Users can discover, configure, and purchase furniture and décor through natural conversation—text and images—without leaving the chat.
+Minoan is a shopping application that runs inside ChatGPT via the Model Context Protocol (MCP). Users can discover and purchase furniture and décor through natural conversation.
 
 ## Features
 
-- **Natural Conversation**: Shop for furniture using natural language
-- **Product Discovery**: Search and browse furniture and décor items
-- **Detailed Product Info**: Get comprehensive details about products
-- **Simple Ordering**: Create orders directly through conversation
-- **Category Browsing**: Explore products by category
+- **Simple Product Catalog**: Browse furniture and décor product names
+- **MCP Integration**: Easy integration with ChatGPT via MCP
+- **Async Database**: Fast async operations with aiosqlite
 
 ## Quick Start
 
@@ -29,118 +27,60 @@ uv run main.py
 
 The server will start on `http://0.0.0.0:8000/mcp`
 
-### Testing
+## MCP Tool
 
-Run the test suite to verify functionality:
+### `get_products`
+Fetch all furniture and décor products from the Minoan catalog.
 
-```bash
-uv run test_minoan.py
+**Returns:**
+```json
+{
+  "status": "success",
+  "count": 10,
+  "products": [
+    {"id": 1, "name": "Modern Velvet Sofa"},
+    {"id": 2, "name": "Scandinavian Dining Table"},
+    ...
+  ]
+}
 ```
 
-## MCP Tools
+**Example Usage in ChatGPT:**
+- "Show me all furniture products"
+- "What products do you have?"
+- "List all items in the catalog"
 
-The Minoan MCP server provides the following tools:
-
-### `search_products`
-Search for furniture and décor products by keyword, category, and price range.
-
-**Parameters:**
-- `query` (string, optional): Search term to match against product name or description
-- `category` (string, optional): Filter by category (e.g., "Living Room", "Bedroom", "Lighting", "Décor")
-- `max_price` (float, optional): Maximum price filter
-- `min_price` (float, optional): Minimum price filter
-
-**Example:**
-```
-search_products(query="sofa", category="Living Room", max_price=2000)
-```
-
-### `get_product_details`
-Get detailed information about a specific product by ID.
-
-**Parameters:**
-- `product_id` (int): ID of the product
-
-**Example:**
-```
-get_product_details(product_id=1)
-```
-
-### `list_categories`
-Get all available product categories.
-
-**Example:**
-```
-list_categories()
-```
-
-### `create_order`
-Create an order for a product.
-
-**Parameters:**
-- `product_id` (int): ID of the product to order
-- `quantity` (int, default: 1): Number of items to order
-- `customer_name` (string, optional): Customer's name
-- `customer_email` (string, optional): Customer's email
-
-**Example:**
-```
-create_order(product_id=1, quantity=2, customer_name="John Doe", customer_email="john@example.com")
-```
-
-## MCP Resources
+## MCP Resource
 
 ### `minoan:///catalog`
 Access the full product catalog as a JSON resource.
 
-## Product Categories
-
-- **Living Room**: Sofas, armchairs, coffee tables
-- **Bedroom**: Beds, nightstands, dressers
-- **Dining Room**: Dining tables, chairs
-- **Lighting**: Floor lamps, pendant lights, chandeliers
-- **Décor**: Vases, wall art, decorative objects
-- **Rugs & Textiles**: Area rugs, throws, pillows
-
-## Database
-
-The application uses SQLite with the following tables:
-
-### Products Table
-- `id`: Product ID
-- `name`: Product name
-- `description`: Detailed product description
-- `category`: Product category
-- `price`: Price in USD
-- `in_stock`: Stock availability (1 = in stock, 0 = out of stock)
-- `dimensions`: Product dimensions
-- `material`: Materials used
-- `color`: Color(s)
-- `image_url`: Product image URL
-
-### Orders Table
-- `id`: Order ID
-- `product_id`: Foreign key to products
-- `quantity`: Number of items ordered
-- `customer_name`: Customer name
-- `customer_email`: Customer email
-- `order_date`: ISO format datetime
-- `status`: Order status (pending, confirmed, shipped, delivered)
+Returns a structured catalog with store information and all products.
 
 ## Sample Products
 
-The database is pre-seeded with 10 furniture and décor items including:
+The catalog includes 10 furniture and décor items:
 
-- Modern Velvet Sofa ($1,299.99)
-- Scandinavian Dining Table ($899.99)
-- Industrial Floor Lamp ($189.99)
-- Bohemian Area Rug ($349.99)
-- Mid-Century Armchair ($699.99)
-- Marble Coffee Table ($549.99)
-- Ceramic Vase Set ($79.99)
-- Platform Bed Frame ($899.99)
-- Rattan Pendant Light ($159.99)
-- Abstract Wall Art ($249.99)
+1. Modern Velvet Sofa
+2. Scandinavian Dining Table
+3. Industrial Floor Lamp
+4. Bohemian Area Rug
+5. Mid-Century Armchair
+6. Marble Coffee Table
+7. Ceramic Vase Set
+8. Platform Bed Frame
+9. Rattan Pendant Light
+10. Abstract Wall Art
+
+## Database
+
+Simple SQLite database with one table:
+
+### Products Table
+- `id`: Product ID (auto-increment)
+- `name`: Product name (text)
+
+Database location: System temp directory (`/tmp/minoan.db` on macOS/Linux)
 
 ## Architecture
 
@@ -151,11 +91,11 @@ The database is pre-seeded with 10 furniture and décor items including:
 
 ## Deployment
 
-The application is deployment-ready for FastMCP Cloud or any MCP-compatible platform:
+Ready for deployment to FastMCP Cloud or any MCP-compatible platform:
 
-1. Ensure all dependencies are in `pyproject.toml`
-2. Commit changes to git
-3. Deploy to your preferred platform
+1. All dependencies are in `pyproject.toml`
+2. Simple, lightweight design
+3. No external API dependencies
 
 ```bash
 git add .
@@ -165,24 +105,10 @@ git push
 
 ## Development
 
-The database file is stored in the system's temporary directory:
-- macOS/Linux: `/tmp/minoan.db`
-- Windows: `%TEMP%\minoan.db`
-
-## Future Enhancements
-
-- Image recognition for visual search
-- Product recommendations based on preferences
-- Shopping cart functionality
-- Multiple payment methods
-- User authentication
-- Order tracking and history
-- Product reviews and ratings
-- Customization options (colors, materials, sizes)
-- 3D product previews
-- AR furniture placement
+- Database auto-initializes on first run
+- Products are seeded automatically
+- Clean async/await pattern throughout
 
 ## License
 
 MIT License
-
