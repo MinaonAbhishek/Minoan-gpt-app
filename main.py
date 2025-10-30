@@ -225,93 +225,101 @@
 from fastmcp import FastMCP
 import json
 import os
-import tempfile
-from difflib import get_close_matches
 import re
+from difflib import SequenceMatcher
 
 mcp = FastMCP("MinoanBrandDiscovery")
 
-# Paths
-TEMP_DIR = tempfile.gettempdir()
-BRAND_JSON = os.path.join(os.path.dirname(__file__), "brands.json")
-
+# ---------------------------------------------------------------------------
 # Load brand data
-try:
-    with open(BRAND_JSON, "r", encoding="utf-8") as f:
-        BRANDS = json.load(f)
-    print(f"✅ Loaded {len(BRANDS)} brands from brands.json")
-except Exception as e:
-    print(f"❌ Error loading brands.json: {e}")
-    BRANDS = []
+# ---------------------------------------------------------------------------
+BRAND_JSON = os.path.join(os.path.dirname(__file__), "brands.json")
+with open(BRAND_JSON, "r", encoding="utf-8") as f:
+    BRANDS = json.load(f)
+print(f"✅ Loaded {len(BRANDS)} brands")
 
-# ------------------------------------------------------------------------------
-# TOOL: Multi-Brand Recommendation
-# ------------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Utility functions
+# ---------------------------------------------------------------------------
+
+def split_query(query: str):
+    """Split complex query into meaningful product phrases."""
+    # Keep multi-word terms (e.g. "smart locks", "bath towels")
+    parts = re.split(r",| and | & | with ", query.lower())
+    parts = [p.strip() for p in parts if len(p.strip()) > 2]
+    return parts
+
+def token_similarity(a, b):
+    """Normalized token similarity (0-1)."""
+    a, b = a.lower(), b.lower()
+    if a == b:
+        return 1.0
+    if a in b or b in a:
+        return 0.85
+    return SequenceMatcher(None, a, b).ratio()
+
+# ---------------------------------------------------------------------------
+# TOOL: Robust Multi-Brand Recommender
+# ---------------------------------------------------------------------------
 
 @mcp.tool()
-def recommend_brands(query: str) -> dict:
+def recommend_brands(query: str, max_results: int = 10) -> dict:
     """
-    Recommend one or more brands for a complex product query.
-    Splits query into parts and returns all matching brands.
+    Recommend multiple relevant brands using keyword + fuzzy logic.
+    - Phrase-based parsing
+    - Weighted scoring
+    - Clean ranked output
     """
 
-    query = query.lower()
-    # Split query into possible product phrases
-    parts = re.split(r"[,\sand]+", query)
-    parts = [p.strip() for p in parts if len(p.strip()) > 1]
+    query = query.strip().lower()
+    if not query:
+        return {"status": "error", "message": "Empty query."}
 
-    found_brands = []
+    phrases = split_query(query)
+    results = []
 
-    for part in parts:
-        for brand in BRANDS:
-            keywords = [kw.lower() for kw in brand.get("keywords", [])]
+    for brand in BRANDS:
+        keywords = [kw.lower() for kw in brand.get("keywords", [])]
+        score = 0.0
+        matched = []
 
-            # 1️⃣ Direct match
-            if any(kw in part for kw in keywords):
-                found_brands.append({
-                    "brand": brand["brand_name"],
-                    "url": brand["web_link"],
-                    "match_type": "keyword",
-                    "matched_with": part,
-                    "description": brand["description"]
-                })
-                continue
-
-            # 2️⃣ Fuzzy match
+        for phrase in phrases:
             for kw in keywords:
-                if get_close_matches(part, [kw], cutoff=0.7):
-                    found_brands.append({
-                        "brand": brand["brand_name"],
-                        "url": brand["web_link"],
-                        "match_type": "fuzzy",
-                        "matched_with": part,
-                        "description": brand["description"]
-                    })
-                    break
+                sim = token_similarity(phrase, kw)
 
-    # Remove duplicates (by brand name)
-    unique_brands = []
-    seen = set()
-    for b in found_brands:
-        if b["brand"] not in seen:
-            unique_brands.append(b)
-            seen.add(b["brand"])
+                # Strong exact or inclusion match
+                if sim >= 0.95:
+                    score += 3.0
+                    matched.append(kw)
+                # Close fuzzy (only for longer words to avoid "rt" noise)
+                elif sim >= 0.8 and len(phrase) >= 4 and len(kw) >= 4:
+                    score += 1.5
+                    matched.append(kw)
 
-    if not unique_brands:
-        return {
-            "status": "no_match",
-            "message": "No matching brands found for your query."
-        }
+        if score > 0:
+            results.append({
+                "brand": brand["brand_name"],
+                "url": brand["web_link"],
+                "score": round(score, 2),
+                "matched_keywords": list(set(matched)),
+                "description": brand["description"]
+            })
+
+    if not results:
+        return {"status": "no_match", "message": "No matching brands found."}
+
+    # Sort by score descending
+    results.sort(key=lambda x: x["score"], reverse=True)
 
     return {
         "status": "success",
-        "total_matches": len(unique_brands),
-        "brands": unique_brands
+        "query": query,
+        "total_matches": len(results),
+        "brands": results[:max_results]
     }
 
-# ------------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Run MCP server
-# ------------------------------------------------------------------------------
-
+# ---------------------------------------------------------------------------
 if __name__ == "__main__":
     mcp.run(transport="http", host="0.0.0.0", port=8000)
