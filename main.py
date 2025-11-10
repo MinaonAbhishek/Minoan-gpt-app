@@ -232,13 +232,13 @@ import base64
 import time
 from datetime import datetime, timedelta
 from difflib import SequenceMatcher
-from fastapi import Request, HTTPException, Query, Form
+from fastapi import HTTPException
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
+from starlette.requests import Request
 import httpx
 import jwt
 
 mcp = FastMCP("MinoanBrandDiscovery")
-app = mcp.app  # Access underlying FastAPI app
 
 # ---------------------------------------------------------------------------
 # OAuth Configuration
@@ -412,10 +412,10 @@ def recommend_brands(query: str, max_results: int = 10) -> dict:
 # OAuth 2.1 + PKCE Endpoints for ChatGPT Integration
 # ---------------------------------------------------------------------------
 
-@app.get("/.well-known/oauth-authorization-server", response_class=JSONResponse)
-async def oauth_authorization_server():
+@mcp.custom_route(path="/.well-known/oauth-authorization-server", methods=["GET"])
+async def oauth_authorization_server(request: Request) -> JSONResponse:
     """OAuth 2.1 discovery endpoint for ChatGPT."""
-    return {
+    return JSONResponse(content={
         "issuer": OAUTH_ISSUER,
         "authorization_endpoint": f"{OAUTH_BASE_URL}/auth/login",
         "token_endpoint": f"{OAUTH_BASE_URL}/auth/token",
@@ -425,11 +425,11 @@ async def oauth_authorization_server():
         "response_types_supported": ["code"],
         "grant_types_supported": ["authorization_code"],
         "token_endpoint_auth_methods_supported": ["none"],  # PKCE only
-    }
+    })
 
 
-@app.get("/.well-known/jwks.json", response_class=JSONResponse)
-async def jwks():
+@mcp.custom_route(path="/.well-known/jwks.json", methods=["GET"])
+async def jwks(request: Request) -> JSONResponse:
     """
     JWKS endpoint for public key verification.
     Note: Since we use HS256 (symmetric), there's no public key.
@@ -438,7 +438,7 @@ async def jwks():
     """
     # For HS256, we can't provide a public key. ChatGPT would need the secret.
     # If switching to RS256, generate an RSA key pair and return the public key here.
-    return {
+    return JSONResponse(content={
         "keys": []
         # In production with RS256:
         # "keys": [{
@@ -448,20 +448,22 @@ async def jwks():
         #     "n": "...",  # RSA modulus (base64url)
         #     "e": "AQAB"  # RSA exponent
         # }]
-    }
+    })
 
 
-@app.get("/auth/login", response_class=HTMLResponse)
-async def auth_login(
-    response_type: str = Query(..., description="Must be 'code'"),
-    client_id: str = Query(..., description="OAuth client ID"),
-    redirect_uri: str = Query(..., description="Callback URI"),
-    state: str = Query(..., description="State parameter for CSRF protection"),
-    code_challenge: str = Query(..., description="PKCE code challenge"),
-    code_challenge_method: str = Query("S256", description="PKCE method (S256)"),
-    scope: str = Query("brands:read", description="Requested scopes"),
-):
+@mcp.custom_route(path="/auth/login", methods=["GET"])
+async def auth_login(request: Request) -> HTMLResponse:
     """OAuth authorization endpoint - shows login form."""
+    # Extract query parameters
+    query_params = request.query_params
+    response_type = query_params.get("response_type", "")
+    client_id = query_params.get("client_id", "")
+    redirect_uri = query_params.get("redirect_uri", "")
+    state = query_params.get("state", "")
+    code_challenge = query_params.get("code_challenge", "")
+    code_challenge_method = query_params.get("code_challenge_method", "S256")
+    scope = query_params.get("scope", "brands:read")
+    
     if response_type != "code":
         raise HTTPException(status_code=400, detail="response_type must be 'code'")
     if code_challenge_method != "S256":
@@ -521,19 +523,21 @@ async def auth_login(
     return HTMLResponse(content=html)
 
 
-@app.post("/auth/login")
-async def auth_login_post(
-    response_type: str = Form(...),
-    client_id: str = Form(...),
-    redirect_uri: str = Form(...),
-    state: str = Form(...),
-    code_challenge: str = Form(...),
-    code_challenge_method: str = Form(...),
-    scope: str = Form(...),
-    email: str = Form(...),
-    password: str = Form(...),
-):
+@mcp.custom_route(path="/auth/login", methods=["POST"])
+async def auth_login_post(request: Request) -> RedirectResponse:
     """Handle login form submission and create authorization code."""
+    # Parse form data
+    form_data = await request.form()
+    response_type = form_data.get("response_type", "")
+    client_id = form_data.get("client_id", "")
+    redirect_uri = form_data.get("redirect_uri", "")
+    state = form_data.get("state", "")
+    code_challenge = form_data.get("code_challenge", "")
+    code_challenge_method = form_data.get("code_challenge_method", "")
+    scope = form_data.get("scope", "")
+    email = form_data.get("email", "")
+    password = form_data.get("password", "")
+    
     print(f"🔐 OAuth login attempt for: {email}")
 
     # Call the actual login API
@@ -580,14 +584,16 @@ async def auth_login_post(
     return RedirectResponse(url=redirect_url, status_code=302)
 
 
-@app.post("/auth/token", response_class=JSONResponse)
-async def auth_token(
-    grant_type: str = Form(...),
-    code: str = Form(...),
-    redirect_uri: str = Form(...),
-    code_verifier: str = Form(..., description="PKCE code verifier"),
-):
+@mcp.custom_route(path="/auth/token", methods=["POST"])
+async def auth_token(request: Request) -> JSONResponse:
     """OAuth token endpoint - exchanges authorization code for access token."""
+    # Parse form data
+    form_data = await request.form()
+    grant_type = form_data.get("grant_type", "")
+    code = form_data.get("code", "")
+    redirect_uri = form_data.get("redirect_uri", "")
+    code_verifier = form_data.get("code_verifier", "")
+    
     if grant_type != "authorization_code":
         raise HTTPException(status_code=400, detail="grant_type must be 'authorization_code'")
 
@@ -615,12 +621,12 @@ async def auth_token(
     print(f"✅ Token exchange successful for user")
 
     # Return OAuth token response
-    return {
+    return JSONResponse(content={
         "access_token": token,
         "token_type": "Bearer",
         "expires_in": 3600,  # 1 hour (adjust based on your token expiry)
         "scope": "brands:read",
-    }
+    })
 
 
 # ---------------------------------------------------------------------------
