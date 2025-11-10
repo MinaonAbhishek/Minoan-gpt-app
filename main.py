@@ -244,10 +244,43 @@ mcp = FastMCP("MinoanBrandDiscovery")
 # OAuth Configuration
 # ---------------------------------------------------------------------------
 OAUTH_ISSUER = os.getenv("OAUTH_ISSUER", "https://dev-my.minoan.com")
-OAUTH_BASE_URL = os.getenv("OAUTH_BASE_URL", "http://localhost:8000")
+# Default to HTTPS for production - ChatGPT requires HTTPS
+OAUTH_BASE_URL = os.getenv("OAUTH_BASE_URL", "https://minoan-app.fastmcp.app")
+# Backend login API - where we authenticate users
 LOGIN_API_URL = "https://devb2b-api.minoanexperience.com/public/account/login"
 JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "")
 JWT_ALG = "HS256"
+
+def get_base_url(request: Request = None) -> str:
+    """
+    Get the base URL for OAuth endpoints.
+    Uses request headers if available, otherwise falls back to OAUTH_BASE_URL.
+    Always uses HTTPS for production.
+    """
+    if request:
+        # Try to get from request headers (for FastMCP Cloud)
+        host = request.headers.get("host") or request.url.hostname
+        if host:
+            # Always use HTTPS in production
+            return f"https://{host}"
+    
+    # Fall back to environment variable or default
+    base_url = OAUTH_BASE_URL
+    # Always ensure HTTPS (no localhost exceptions in production)
+    if base_url.startswith("http://"):
+        base_url = base_url.replace("http://", "https://")
+    return base_url
+
+
+def validate_redirect_uri(redirect_uri: str) -> bool:
+    """
+    Validate that redirect URI is safe - requires HTTPS.
+    ChatGPT requires HTTPS for all redirect URIs in production.
+    """
+    if not redirect_uri:
+        return False
+    # Require HTTPS for all URLs (no localhost exceptions in production)
+    return redirect_uri.startswith("https://")
 
 # In-memory store for authorization codes (expires after 10 minutes)
 # In production, use Redis or a database
@@ -419,12 +452,13 @@ def recommend_brands(query: str, max_results: int = 10) -> dict:
 @mcp.custom_route(path="/.well-known/oauth-authorization-server", methods=["GET"])
 async def oauth_authorization_server(request: Request) -> JSONResponse:
     """OAuth 2.1 discovery endpoint for ChatGPT."""
+    base_url = get_base_url(request)
     return JSONResponse(content={
         "issuer": OAUTH_ISSUER,
-        "authorization_endpoint": f"{OAUTH_BASE_URL}/auth/login",
-        "token_endpoint": f"{OAUTH_BASE_URL}/auth/token",
-        "jwks_uri": f"{OAUTH_BASE_URL}/.well-known/jwks.json",
-        "registration_endpoint": f"{OAUTH_BASE_URL}/register",  # RFC 7591
+        "authorization_endpoint": f"{base_url}/auth/login",  # Our server handles OAuth flow
+        "token_endpoint": f"{base_url}/auth/token",
+        "jwks_uri": f"{base_url}/.well-known/jwks.json",
+        "registration_endpoint": f"{base_url}/register",  # RFC 7591
         "code_challenge_methods_supported": ["S256"],
         "scopes_supported": ["brands:read"],
         "response_types_supported": ["code"],
@@ -473,6 +507,11 @@ async def auth_login(request: Request) -> HTMLResponse:
         raise HTTPException(status_code=400, detail="response_type must be 'code'")
     if code_challenge_method != "S256":
         raise HTTPException(status_code=400, detail="Only S256 code challenge method supported")
+    if not validate_redirect_uri(redirect_uri):
+        raise HTTPException(
+            status_code=400, 
+            detail="redirect_uri must use HTTPS"
+        )
 
     # Store OAuth params in session (simplified - in production use proper sessions)
     # For now, pass via query params to the form
@@ -600,6 +639,8 @@ async def register_client(request: Request) -> JSONResponse:
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON body")
     
+    base_url = get_base_url(request)
+    
     # Generate client_id and client_secret (though with PKCE, secret may not be needed)
     client_id = secrets.token_urlsafe(32)
     client_secret = secrets.token_urlsafe(32)
@@ -626,7 +667,7 @@ async def register_client(request: Request) -> JSONResponse:
         "client_id_issued_at": int(time.time()),
         "client_secret_expires_at": 0,  # 0 means never expires
         "registration_access_token": secrets.token_urlsafe(32),  # For client management
-        "registration_client_uri": f"{OAUTH_BASE_URL}/register/{client_id}",
+        "registration_client_uri": f"{base_url}/register/{client_id}",
         "redirect_uris": registered_clients[client_id]["redirect_uris"],
         "grant_types": registered_clients[client_id]["grant_types"],
         "response_types": registered_clients[client_id]["response_types"],
@@ -688,6 +729,6 @@ if __name__ == "__main__":
     print(f"📋 OAuth Discovery: {OAUTH_BASE_URL}/.well-known/oauth-authorization-server")
     print(f"🔑 JWKS: {OAUTH_BASE_URL}/.well-known/jwks.json")
     print(f"📝 Client Registration: {OAUTH_BASE_URL}/register (RFC 7591)")
-    print(f"🔐 Authorization: {OAUTH_BASE_URL}/auth/login")
-    print(f"🎫 Token: {OAUTH_BASE_URL}/auth/token")
+    print(f"🔐 Authorization Endpoint: {OAUTH_BASE_URL}/auth/login")
+    print(f"🎫 Token Endpoint: {OAUTH_BASE_URL}/auth/token")
     mcp.run(transport="http", host="0.0.0.0", port=8000)
