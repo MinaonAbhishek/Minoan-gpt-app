@@ -571,7 +571,12 @@ async def auth_login(request: Request) -> HTMLResponse:
 async def auth_login_post(request: Request) -> RedirectResponse:
     """Handle login form submission and create authorization code."""
     # Parse form data
-    form_data = await request.form()
+    try:
+        form_data = await request.form()
+    except Exception as e:
+        print(f"❌ Error parsing form data: {e}")
+        raise HTTPException(status_code=400, detail="Invalid form data")
+    
     response_type = form_data.get("response_type", "")
     client_id = form_data.get("client_id", "")
     redirect_uri = form_data.get("redirect_uri", "")
@@ -583,6 +588,29 @@ async def auth_login_post(request: Request) -> RedirectResponse:
     password = form_data.get("password", "")
     
     print(f"🔐 OAuth login attempt for: {email}")
+    print(f"📋 Received parameters:")
+    print(f"   - response_type: {response_type}")
+    print(f"   - client_id: {client_id}")
+    print(f"   - redirect_uri: {redirect_uri}")
+    print(f"   - state: {state}")
+    print(f"   - code_challenge: {code_challenge[:30] if code_challenge else 'MISSING'}...")
+    
+    # Validate required parameters - redirect with error if missing
+    if not redirect_uri:
+        print(f"❌ Missing redirect_uri")
+        # Can't redirect without redirect_uri, so return error page
+        return HTMLResponse(
+            content="<h1>Error</h1><p>Missing redirect_uri parameter</p>",
+            status_code=400
+        )
+    if not state:
+        print(f"❌ Missing state - redirecting with error")
+        error_redirect = f"{redirect_uri}?error=invalid_request&error_description=Missing+state+parameter"
+        return RedirectResponse(url=error_redirect, status_code=302)
+    if not code_challenge:
+        print(f"❌ Missing code_challenge - redirecting with error")
+        error_redirect = f"{redirect_uri}?error=invalid_request&error_description=Missing+code_challenge+parameter&state={state}"
+        return RedirectResponse(url=error_redirect, status_code=302)
 
     # Call the actual login API
     async with httpx.AsyncClient(timeout=30.0) as client:
@@ -615,17 +643,38 @@ async def auth_login_post(request: Request) -> RedirectResponse:
         return RedirectResponse(url=error_redirect, status_code=302)
 
     print(f"✅ Login successful, token extracted: {token[:20]}...")
+    print(f"📋 Redirect URI: {redirect_uri}")
+    print(f"📋 State: {state}")
+    print(f"📋 Code Challenge: {code_challenge[:20]}...")
+
+    # Validate redirect_uri
+    if not validate_redirect_uri(redirect_uri):
+        print(f"❌ Invalid redirect_uri: {redirect_uri}")
+        error_redirect = f"{redirect_uri}?error=invalid_request&error_description=Invalid+redirect_uri&state={state}"
+        return RedirectResponse(url=error_redirect, status_code=302)
 
     # Create authorization code
-    auth_code = create_authorization_code(state, code_challenge, redirect_uri)
-
-    # Store token with the code (for token exchange)
-    auth_codes[auth_code]["token"] = token
-    auth_codes[auth_code]["user_data"] = token_data
-
-    # Redirect to callback with authorization code
-    redirect_url = f"{redirect_uri}?code={auth_code}&state={state}"
-    return RedirectResponse(url=redirect_url, status_code=302)
+    try:
+        auth_code = create_authorization_code(state, code_challenge, redirect_uri)
+        
+        # Store token with the code (for token exchange)
+        auth_codes[auth_code]["token"] = token
+        auth_codes[auth_code]["user_data"] = token_data
+        
+        # Build redirect URL - check if redirect_uri already has query params
+        separator = "&" if "?" in redirect_uri else "?"
+        redirect_url = f"{redirect_uri}{separator}code={auth_code}&state={state}"
+        
+        print(f"✅ Created authorization code: {auth_code[:16]}...")
+        print(f"🔄 Redirecting to: {redirect_url}")
+        
+        return RedirectResponse(url=redirect_url, status_code=302)
+    except Exception as e:
+        print(f"❌ Error creating authorization code: {e}")
+        import traceback
+        traceback.print_exc()
+        error_redirect = f"{redirect_uri}?error=server_error&error_description=Failed+to+create+authorization+code&state={state}"
+        return RedirectResponse(url=error_redirect, status_code=302)
 
 
 @mcp.custom_route(path="/register", methods=["POST"])
