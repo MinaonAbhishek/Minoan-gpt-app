@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Minoan Login - OAuth Integration</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+      max-width: 400px;
+      margin: 50px auto;
+      padding: 20px;
+      background: #f9fafb;
+    }
+    .container {
+      background: white;
+      padding: 30px;
+      border-radius: 8px;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+    }
+    h1 {
+      font-size: 24px;
+      margin-bottom: 20px;
+      color: #111827;
+    }
+    .form-group {
+      margin-bottom: 20px;
+    }
+    label {
+      display: block;
+      margin-bottom: 8px;
+      font-size: 14px;
+      font-weight: 500;
+      color: #374151;
+    }
+    input {
+      width: 100%;
+      padding: 10px 12px;
+      border: 1px solid #d1d5db;
+      border-radius: 6px;
+      font-size: 14px;
+      box-sizing: border-box;
+    }
+    input:focus {
+      outline: none;
+      border-color: #3b82f6;
+      box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1);
+    }
+    button {
+      width: 100%;
+      padding: 12px;
+      background: #111827;
+      color: white;
+      border: none;
+      border-radius: 6px;
+      font-size: 16px;
+      font-weight: 500;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+    button:hover {
+      background: #1f2937;
+    }
+    button:disabled {
+      background: #9ca3af;
+      cursor: not-allowed;
+    }
+    .error {
+      color: #dc2626;
+      font-size: 14px;
+      margin-top: 10px;
+      padding: 10px;
+      background: #fef2f2;
+      border-radius: 6px;
+      display: none;
+    }
+    .error.show {
+      display: block;
+    }
+    .oauth-info {
+      font-size: 12px;
+      color: #6b7280;
+      margin-top: 20px;
+      padding: 10px;
+      background: #f3f4f6;
+      border-radius: 6px;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Sign in to Minoan</h1>
+    
+    <form id="loginForm">
+      <div class="form-group">
+        <label for="email">Email</label>
+        <input 
+          type="email" 
+          id="email" 
+          name="email" 
+          placeholder="you@example.com" 
+          required 
+          autofocus
+        >
+      </div>
+      
+      <div class="form-group">
+        <label for="password">Password</label>
+        <input 
+          type="password" 
+          id="password" 
+          name="password" 
+          placeholder="••••••••" 
+          required
+        >
+      </div>
+      
+      <button type="submit" id="submitBtn">Sign In</button>
+      
+      <div id="error" class="error"></div>
+    </form>
+    
+    <div id="oauthInfo" class="oauth-info" style="display: none;">
+      <strong>OAuth Request Detected</strong><br>
+      <span id="oauthDetails"></span>
+    </div>
+  </div>
+
+  <script>
+    // Configuration
+    const OAUTH_CALLBACK_URL = 'https://minoan-app.fastmcp.app/auth/callback';
+    const LOGIN_API_URL = 'https://devb2b-api.minoanexperience.com/public/account/login';
+
+    /**
+     * Extract OAuth parameters from URL
+     */
+    function getOAuthParams() {
+      const urlParams = new URLSearchParams(window.location.search);
+      return {
+        response_type: urlParams.get('response_type'),
+        client_id: urlParams.get('client_id'),
+        redirect_uri: urlParams.get('redirect_uri'),
+        state: urlParams.get('state'),
+        code_challenge: urlParams.get('code_challenge'),
+        code_challenge_method: urlParams.get('code_challenge_method') || 'S256',
+        scope: urlParams.get('scope') || 'brands:read',
+      };
+    }
+
+    /**
+     * Check if this is an OAuth request
+     */
+    function isOAuthRequest() {
+      const params = getOAuthParams();
+      return params.response_type === 'code' && params.redirect_uri && params.state;
+    }
+
+    /**
+     * Show error message
+     */
+    function showError(message) {
+      const errorDiv = document.getElementById('error');
+      errorDiv.textContent = message;
+      errorDiv.classList.add('show');
+    }
+
+    /**
+     * Hide error message
+     */
+    function hideError() {
+      const errorDiv = document.getElementById('error');
+      errorDiv.classList.remove('show');
+    }
+
+    /**
+     * Redirect to OAuth callback
+     */
+    function redirectToOAuthCallback(token, oauthParams) {
+      const callbackUrl = new URL(OAUTH_CALLBACK_URL);
+      
+      callbackUrl.searchParams.set('token', token);
+      callbackUrl.searchParams.set('redirect_uri', oauthParams.redirect_uri);
+      callbackUrl.searchParams.set('state', oauthParams.state);
+      callbackUrl.searchParams.set('code_challenge', oauthParams.code_challenge);
+      callbackUrl.searchParams.set('code_challenge_method', oauthParams.code_challenge_method);
+      
+      console.log('🔄 Redirecting to OAuth callback');
+      window.location.href = callbackUrl.toString();
+    }
+
+    /**
+     * Redirect with error
+     */
+    function redirectWithError(oauthParams, error, description) {
+      if (!oauthParams.redirect_uri) {
+        showError(`Error: ${description}`);
+        return;
+      }
+      
+      const errorUrl = new URL(oauthParams.redirect_uri);
+      errorUrl.searchParams.set('error', error);
+      errorUrl.searchParams.set('error_description', description);
+      if (oauthParams.state) {
+        errorUrl.searchParams.set('state', oauthParams.state);
+      }
+      
+      console.error('❌ Redirecting with error:', error, description);
+      window.location.href = errorUrl.toString();
+    }
+
+    /**
+     * Handle login
+     */
+    async function handleLogin(email, password, oauthParams) {
+      const submitBtn = document.getElementById('submitBtn');
+      submitBtn.disabled = true;
+      submitBtn.textContent = 'Signing in...';
+      hideError();
+
+      try {
+        console.log('🔐 Attempting login');
+        
+        const response = await fetch(LOGIN_API_URL, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+          },
+          body: JSON.stringify({ email, password }),
+        });
+        
+        if (!response.ok) {
+          const errorData = await response.json().catch(() => ({}));
+          console.error('❌ Login failed:', response.status);
+          
+          if (oauthParams.redirect_uri) {
+            redirectWithError(oauthParams, 'access_denied', 'Invalid email or password');
+          } else {
+            showError('Invalid email or password. Please try again.');
+            submitBtn.disabled = false;
+            submitBtn.textContent = 'Sign In';
+          }
+          return;
+        }
+        
+        const data = await response.json();
+        console.log('✅ Login successful');
+        
+        // Extract token
+        const token = data?.data?.token || data?.token;
+        
+        if (!token) {
+          console.error('❌ Token not found');
+          if (oauthParams.redirect_uri) {
+            redirectWithError(oauthParams, 'server_error', 'Token not found');
+          } else {
+            showError('Login failed: Token not received');
+            submitBtn.disabled = false;
+            submitBtn.textContent = 'Sign In';
+          }
+          return;
+        }
+        
+        // If OAuth request, redirect to callback
+        if (oauthParams.redirect_uri) {
+          console.log('✅ Redirecting to OAuth callback');
+          redirectToOAuthCallback(token, oauthParams);
+        } else {
+          // Normal login (not OAuth) - handle as needed
+          console.log('✅ Login successful (non-OAuth)');
+          showError('Login successful! (OAuth redirect not configured)');
+          submitBtn.disabled = false;
+          submitBtn.textContent = 'Sign In';
+        }
+        
+      } catch (error) {
+        console.error('❌ Login error:', error);
+        
+        if (oauthParams.redirect_uri) {
+          redirectWithError(oauthParams, 'server_error', `Login error: ${error.message}`);
+        } else {
+          showError(`Login failed: ${error.message}`);
+          submitBtn.disabled = false;
+          submitBtn.textContent = 'Sign In';
+        }
+      }
+    }
+
+    // Initialize
+    document.addEventListener('DOMContentLoaded', () => {
+      const oauthParams = getOAuthParams();
+      const isOAuth = isOAuthRequest();
+      
+      // Show OAuth info if this is an OAuth request
+      if (isOAuth) {
+        const oauthInfo = document.getElementById('oauthInfo');
+        const oauthDetails = document.getElementById('oauthDetails');
+        oauthInfo.style.display = 'block';
+        oauthDetails.textContent = `Connecting to: ${oauthParams.client_id || 'ChatGPT'}`;
+      }
+      
+      // Handle form submission
+      document.getElementById('loginForm').addEventListener('submit', (e) => {
+        e.preventDefault();
+        
+        const email = document.getElementById('email').value.trim();
+        const password = document.getElementById('password').value;
+        
+        if (!email || !password) {
+          showError('Please enter both email and password');
+          return;
+        }
+        
+        handleLogin(email, password, oauthParams);
+      });
+    });
+  </script>
+</body>
+</html>
+

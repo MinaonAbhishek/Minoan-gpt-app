@@ -477,7 +477,7 @@ async def oauth_authorization_server(request: Request) -> JSONResponse:
     base_url = get_base_url(request)
     response = JSONResponse(content={
         "issuer": OAUTH_ISSUER,
-        "authorization_endpoint": USER_LOGIN_PAGE,  # User's existing login page
+        "authorization_endpoint": f"{base_url}/auth/login",  # Our server handles login
         "token_endpoint": f"{base_url}/auth/token",
         "jwks_uri": f"{base_url}/.well-known/jwks.json",
         "registration_endpoint": f"{base_url}/register",  # RFC 7591
@@ -644,15 +644,25 @@ async def auth_login_post(request: Request) -> RedirectResponse:
         error_redirect = f"{redirect_uri}?error=invalid_request&error_description=Missing+code_challenge+parameter&state={state}"
         return RedirectResponse(url=error_redirect, status_code=302)
 
-    # Call the actual login API
+    # Call the actual login API with all required headers
     async with httpx.AsyncClient(timeout=30.0) as client:
         try:
+            # Get timezone and offset from request headers or use defaults
+            timezone = request.headers.get("timezone", "UTC")
+            utcoffset = request.headers.get("utcoffset", "0")
+            
             login_resp = await client.post(
                 LOGIN_API_URL,
                 json={"email": email, "password": password},
                 headers={
                     "Content-Type": "application/json",
-                    "Accept": "application/json",
+                    "Accept": "application/json, text/plain, */*",
+                    "Accept-Language": "en-GB,en-US;q=0.9,en;q=0.8",
+                    "Origin": "https://dev-my.minoan.com",
+                    "Referer": "https://dev-my.minoan.com/",
+                    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36",
+                    "timeZone": timezone,
+                    "utcoffset": utcoffset,
                 },
             )
             login_resp.raise_for_status()
@@ -728,10 +738,12 @@ async def auth_callback(request: Request) -> RedirectResponse:
     code_challenge_method = query_params.get("code_challenge_method", "S256")
     
     print(f"🔄 OAuth callback received")
+    print(f"📋 Full request URL: {request.url}")
     print(f"📋 Token: {token[:20] if token else 'MISSING'}...")
     print(f"📋 Redirect URI: {redirect_uri}")
     print(f"📋 State: {state}")
     print(f"📋 Code Challenge: {code_challenge[:30] if code_challenge else 'MISSING'}...")
+    print(f"📋 All query params: {dict(query_params)}")
     
     # Validate required parameters
     if not token:
@@ -990,7 +1002,7 @@ if __name__ == "__main__":
     print(f"📋 OAuth Discovery: {OAUTH_BASE_URL}/.well-known/oauth-authorization-server")
     print(f"🔑 JWKS: {OAUTH_BASE_URL}/.well-known/jwks.json")
     print(f"📝 Client Registration: {OAUTH_BASE_URL}/register (RFC 7591)")
-    print(f"🔐 Authorization Endpoint (User Login): {USER_LOGIN_PAGE}")
-    print(f"🔄 OAuth Callback: {OAUTH_BASE_URL}/auth/callback")
+    print(f"🔐 Authorization Endpoint: {OAUTH_BASE_URL}/auth/login (Our server)")
     print(f"🎫 Token Endpoint: {OAUTH_BASE_URL}/auth/token")
+    print(f"💡 Note: Login API: {LOGIN_API_URL}")
     mcp.run(transport="http", host="0.0.0.0", port=8000)
