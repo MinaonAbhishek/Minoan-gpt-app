@@ -253,6 +253,10 @@ JWT_ALG = "HS256"
 # In production, use Redis or a database
 auth_codes: dict[str, dict] = {}
 
+# In-memory store for registered OAuth clients (RFC 7591)
+# In production, use a database
+registered_clients: dict[str, dict] = {}
+
 # ---------------------------------------------------------------------------
 # OAuth Helper Functions
 # ---------------------------------------------------------------------------
@@ -420,6 +424,7 @@ async def oauth_authorization_server(request: Request) -> JSONResponse:
         "authorization_endpoint": f"{OAUTH_BASE_URL}/auth/login",
         "token_endpoint": f"{OAUTH_BASE_URL}/auth/token",
         "jwks_uri": f"{OAUTH_BASE_URL}/.well-known/jwks.json",
+        "registration_endpoint": f"{OAUTH_BASE_URL}/register",  # RFC 7591
         "code_challenge_methods_supported": ["S256"],
         "scopes_supported": ["brands:read"],
         "response_types_supported": ["code"],
@@ -584,6 +589,52 @@ async def auth_login_post(request: Request) -> RedirectResponse:
     return RedirectResponse(url=redirect_url, status_code=302)
 
 
+@mcp.custom_route(path="/register", methods=["POST"])
+async def register_client(request: Request) -> JSONResponse:
+    """
+    RFC 7591 Dynamic Client Registration endpoint.
+    Allows ChatGPT to register itself as an OAuth client.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    
+    # Generate client_id and client_secret (though with PKCE, secret may not be needed)
+    client_id = secrets.token_urlsafe(32)
+    client_secret = secrets.token_urlsafe(32)
+    
+    # Store client registration
+    registered_clients[client_id] = {
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "client_name": body.get("client_name", "ChatGPT MCP Client"),
+        "redirect_uris": body.get("redirect_uris", []),
+        "grant_types": body.get("grant_types", ["authorization_code"]),
+        "response_types": body.get("response_types", ["code"]),
+        "scope": body.get("scope", "brands:read"),
+        "token_endpoint_auth_method": body.get("token_endpoint_auth_method", "none"),  # PKCE
+        "created_at": time.time(),
+    }
+    
+    print(f"✅ Registered new OAuth client: {client_id[:16]}...")
+    
+    # Return client registration response (RFC 7591)
+    return JSONResponse(content={
+        "client_id": client_id,
+        "client_secret": client_secret,  # Optional with PKCE, but included for compatibility
+        "client_id_issued_at": int(time.time()),
+        "client_secret_expires_at": 0,  # 0 means never expires
+        "registration_access_token": secrets.token_urlsafe(32),  # For client management
+        "registration_client_uri": f"{OAUTH_BASE_URL}/register/{client_id}",
+        "redirect_uris": registered_clients[client_id]["redirect_uris"],
+        "grant_types": registered_clients[client_id]["grant_types"],
+        "response_types": registered_clients[client_id]["response_types"],
+        "scope": registered_clients[client_id]["scope"],
+        "token_endpoint_auth_method": registered_clients[client_id]["token_endpoint_auth_method"],
+    })
+
+
 @mcp.custom_route(path="/auth/token", methods=["POST"])
 async def auth_token(request: Request) -> JSONResponse:
     """OAuth token endpoint - exchanges authorization code for access token."""
@@ -636,6 +687,7 @@ if __name__ == "__main__":
     print(f"🚀 Starting Minoan OAuth server on http://0.0.0.0:8000")
     print(f"📋 OAuth Discovery: {OAUTH_BASE_URL}/.well-known/oauth-authorization-server")
     print(f"🔑 JWKS: {OAUTH_BASE_URL}/.well-known/jwks.json")
+    print(f"📝 Client Registration: {OAUTH_BASE_URL}/register (RFC 7591)")
     print(f"🔐 Authorization: {OAUTH_BASE_URL}/auth/login")
     print(f"🎫 Token: {OAUTH_BASE_URL}/auth/token")
     mcp.run(transport="http", host="0.0.0.0", port=8000)
