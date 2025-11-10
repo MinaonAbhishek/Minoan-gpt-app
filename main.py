@@ -246,10 +246,19 @@ mcp = FastMCP("MinoanBrandDiscovery")
 OAUTH_ISSUER = os.getenv("OAUTH_ISSUER", "https://dev-my.minoan.com")
 # Default to HTTPS for production - ChatGPT requires HTTPS
 OAUTH_BASE_URL = os.getenv("OAUTH_BASE_URL", "https://minoan-app.fastmcp.app")
+# User login page - where users authenticate
+USER_LOGIN_PAGE = os.getenv("USER_LOGIN_PAGE", "https://dev-my.minoan.com/auth/login")
 # Backend login API - where we authenticate users
 LOGIN_API_URL = "https://devb2b-api.minoanexperience.com/public/account/login"
 JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "")
 JWT_ALG = "HS256"
+
+# Validate critical configuration
+if not JWT_SECRET_KEY:
+    import sys
+    print("❌ ERROR: JWT_SECRET_KEY environment variable is required")
+    print("   Set it with: export JWT_SECRET_KEY='your-secret-key'")
+    sys.exit(1)
 
 def get_base_url(request: Request = None) -> str:
     """
@@ -346,6 +355,18 @@ def get_authorization_code(code: str) -> dict | None:
         del auth_codes[code]
         return None
     return data
+
+
+def cleanup_expired_codes():
+    """Clean up expired authorization codes to prevent memory leaks."""
+    current_time = time.time()
+    expired = [code for code, data in list(auth_codes.items()) 
+               if current_time > data.get("expires_at", 0)]
+    for code in expired:
+        del auth_codes[code]
+    if expired:
+        print(f"🧹 Cleaned up {len(expired)} expired authorization codes")
+    return len(expired)
 
 
 def consume_authorization_code(code: str) -> dict | None:
@@ -453,9 +474,9 @@ def recommend_brands(query: str, max_results: int = 10) -> dict:
 async def oauth_authorization_server(request: Request) -> JSONResponse:
     """OAuth 2.1 discovery endpoint for ChatGPT."""
     base_url = get_base_url(request)
-    return JSONResponse(content={
+    response = JSONResponse(content={
         "issuer": OAUTH_ISSUER,
-        "authorization_endpoint": f"{base_url}/auth/login",  # Our server handles OAuth flow
+        "authorization_endpoint": USER_LOGIN_PAGE,  # User's existing login page
         "token_endpoint": f"{base_url}/auth/token",
         "jwks_uri": f"{base_url}/.well-known/jwks.json",
         "registration_endpoint": f"{base_url}/register",  # RFC 7591
@@ -464,7 +485,17 @@ async def oauth_authorization_server(request: Request) -> JSONResponse:
         "response_types_supported": ["code"],
         "grant_types_supported": ["authorization_code"],
         "token_endpoint_auth_methods_supported": ["none"],  # PKCE only
+        "response_modes_supported": ["query"],
     })
+    # Add CORS headers for discovery endpoint
+    # In production, restrict to specific origins via CORS_ALLOWED_ORIGINS env var
+    allowed_origins = os.getenv("CORS_ALLOWED_ORIGINS", "*").split(",")
+    origin = request.headers.get("origin")
+    if "*" in allowed_origins or (origin and origin in allowed_origins):
+        response.headers["Access-Control-Allow-Origin"] = origin if origin and origin in allowed_origins else "*"
+    response.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    return response
 
 
 @mcp.custom_route(path="/.well-known/jwks.json", methods=["GET"])
@@ -677,18 +708,111 @@ async def auth_login_post(request: Request) -> RedirectResponse:
         return RedirectResponse(url=error_redirect, status_code=302)
 
 
-@mcp.custom_route(path="/register", methods=["POST"])
+@mcp.custom_route(path="/auth/callback", methods=["GET"])
+async def auth_callback(request: Request) -> RedirectResponse:
+    """
+    OAuth callback endpoint - called by user's login page after successful authentication.
+    The login page at https://dev-my.minoan.com/auth/login should redirect here with:
+    - token: JWT token from successful login
+    - redirect_uri: Original OAuth redirect_uri
+    - state: OAuth state parameter
+    - code_challenge: PKCE code challenge
+    - code_challenge_method: PKCE method (S256)
+    """
+    query_params = request.query_params
+    token = query_params.get("token", "")
+    redirect_uri = query_params.get("redirect_uri", "")
+    state = query_params.get("state", "")
+    code_challenge = query_params.get("code_challenge", "")
+    code_challenge_method = query_params.get("code_challenge_method", "S256")
+    
+    print(f"🔄 OAuth callback received")
+    print(f"📋 Token: {token[:20] if token else 'MISSING'}...")
+    print(f"📋 Redirect URI: {redirect_uri}")
+    print(f"📋 State: {state}")
+    print(f"📋 Code Challenge: {code_challenge[:30] if code_challenge else 'MISSING'}...")
+    
+    # Validate required parameters
+    if not token:
+        print(f"❌ Missing token in callback")
+        if redirect_uri:
+            error_redirect = f"{redirect_uri}?error=server_error&error_description=Missing+token&state={state}"
+            return RedirectResponse(url=error_redirect, status_code=302)
+        return HTMLResponse(content="<h1>Error</h1><p>Missing token parameter</p>", status_code=400)
+    
+    if not redirect_uri:
+        print(f"❌ Missing redirect_uri in callback")
+        return HTMLResponse(content="<h1>Error</h1><p>Missing redirect_uri parameter</p>", status_code=400)
+    
+    if not state:
+        print(f"❌ Missing state in callback")
+        error_redirect = f"{redirect_uri}?error=invalid_request&error_description=Missing+state"
+        return RedirectResponse(url=error_redirect, status_code=302)
+    
+    if not code_challenge:
+        print(f"❌ Missing code_challenge in callback")
+        error_redirect = f"{redirect_uri}?error=invalid_request&error_description=Missing+code_challenge&state={state}"
+        return RedirectResponse(url=error_redirect, status_code=302)
+    
+    # Validate redirect_uri
+    if not validate_redirect_uri(redirect_uri):
+        print(f"❌ Invalid redirect_uri: {redirect_uri}")
+        error_redirect = f"{redirect_uri}?error=invalid_request&error_description=Invalid+redirect_uri&state={state}"
+        return RedirectResponse(url=error_redirect, status_code=302)
+    
+    # Create authorization code
+    try:
+        auth_code = create_authorization_code(state, code_challenge, redirect_uri)
+        
+        # Store token with the code (for token exchange)
+        auth_codes[auth_code]["token"] = token
+        # Store minimal user data (you can extract from token if needed)
+        auth_codes[auth_code]["user_data"] = {}
+        
+        # Build redirect URL - check if redirect_uri already has query params
+        separator = "&" if "?" in redirect_uri else "?"
+        redirect_url = f"{redirect_uri}{separator}code={auth_code}&state={state}"
+        
+        print(f"✅ Created authorization code: {auth_code[:16]}...")
+        print(f"🔄 Redirecting to ChatGPT: {redirect_url}")
+        
+        return RedirectResponse(url=redirect_url, status_code=302)
+    except Exception as e:
+        print(f"❌ Error creating authorization code: {e}")
+        import traceback
+        traceback.print_exc()
+        error_redirect = f"{redirect_uri}?error=server_error&error_description=Failed+to+create+authorization+code&state={state}"
+        return RedirectResponse(url=error_redirect, status_code=302)
+
+
+@mcp.custom_route(path="/register", methods=["POST", "OPTIONS"])
 async def register_client(request: Request) -> JSONResponse:
     """
     RFC 7591 Dynamic Client Registration endpoint.
     Allows ChatGPT to register itself as an OAuth client.
     """
+    # Handle CORS preflight
+    if request.method == "OPTIONS":
+        response = JSONResponse(content={})
+        response.headers["Access-Control-Allow-Origin"] = "*"
+        response.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+        return response
+    
     try:
         body = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    except Exception as e:
+        print(f"❌ Error parsing registration request: {e}")
+        return JSONResponse(
+            status_code=400,
+            content={"error": "invalid_request", "error_description": "Invalid JSON body"}
+        )
     
     base_url = get_base_url(request)
+    
+    print(f"📝 Client registration request")
+    print(f"📋 Client name: {body.get('client_name', 'Unknown')}")
+    print(f"📋 Redirect URIs: {body.get('redirect_uris', [])}")
     
     # Generate client_id and client_secret (though with PKCE, secret may not be needed)
     client_id = secrets.token_urlsafe(32)
@@ -710,7 +834,7 @@ async def register_client(request: Request) -> JSONResponse:
     print(f"✅ Registered new OAuth client: {client_id[:16]}...")
     
     # Return client registration response (RFC 7591)
-    return JSONResponse(content={
+    response = JSONResponse(content={
         "client_id": client_id,
         "client_secret": client_secret,  # Optional with PKCE, but included for compatibility
         "client_id_issued_at": int(time.time()),
@@ -723,50 +847,137 @@ async def register_client(request: Request) -> JSONResponse:
         "scope": registered_clients[client_id]["scope"],
         "token_endpoint_auth_method": registered_clients[client_id]["token_endpoint_auth_method"],
     })
+    # Add CORS headers
+    # In production, restrict to specific origins via CORS_ALLOWED_ORIGINS env var
+    allowed_origins = os.getenv("CORS_ALLOWED_ORIGINS", "*").split(",")
+    origin = request.headers.get("origin")
+    if "*" in allowed_origins or (origin and origin in allowed_origins):
+        response.headers["Access-Control-Allow-Origin"] = origin if origin and origin in allowed_origins else "*"
+    response.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    return response
 
 
 @mcp.custom_route(path="/auth/token", methods=["POST"])
 async def auth_token(request: Request) -> JSONResponse:
     """OAuth token endpoint - exchanges authorization code for access token."""
-    # Parse form data
-    form_data = await request.form()
-    grant_type = form_data.get("grant_type", "")
-    code = form_data.get("code", "")
-    redirect_uri = form_data.get("redirect_uri", "")
-    code_verifier = form_data.get("code_verifier", "")
+    # Support both form data and JSON (OAuth 2.1 spec allows both)
+    content_type = request.headers.get("content-type", "")
     
+    try:
+        if "application/json" in content_type:
+            body = await request.json()
+            grant_type = body.get("grant_type", "")
+            code = body.get("code", "")
+            redirect_uri = body.get("redirect_uri", "")
+            code_verifier = body.get("code_verifier", "")
+        else:
+            form_data = await request.form()
+            grant_type = form_data.get("grant_type", "")
+            code = form_data.get("code", "")
+            redirect_uri = form_data.get("redirect_uri", "")
+            code_verifier = form_data.get("code_verifier", "")
+    except Exception as e:
+        print(f"❌ Error parsing request: {e}")
+        return JSONResponse(
+            status_code=400,
+            content={"error": "invalid_request", "error_description": "Invalid request format"}
+        )
+    
+    print(f"🔐 Token exchange request")
+    print(f"📋 Grant type: {grant_type}")
+    print(f"📋 Code: {code[:16] if code else 'MISSING'}...")
+    print(f"📋 Redirect URI: {redirect_uri}")
+    print(f"📋 Code verifier: {code_verifier[:20] if code_verifier else 'MISSING'}...")
+    
+    # Validate grant_type
     if grant_type != "authorization_code":
-        raise HTTPException(status_code=400, detail="grant_type must be 'authorization_code'")
-
-    print(f"🔐 Token exchange request for code: {code[:16]}...")
+        return JSONResponse(
+            status_code=400,
+            content={"error": "unsupported_grant_type", "error_description": "grant_type must be 'authorization_code'"}
+        )
+    
+    # Validate required parameters
+    if not code:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "invalid_request", "error_description": "Missing code parameter"}
+        )
+    if not redirect_uri:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "invalid_request", "error_description": "Missing redirect_uri parameter"}
+        )
+    if not code_verifier:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "invalid_request", "error_description": "Missing code_verifier parameter"}
+        )
 
     # Retrieve and validate authorization code
     code_data = consume_authorization_code(code)
     if not code_data:
-        raise HTTPException(status_code=400, detail="Invalid or expired authorization code")
+        print(f"❌ Invalid or expired authorization code")
+        return JSONResponse(
+            status_code=400,
+            content={"error": "invalid_grant", "error_description": "Invalid or expired authorization code"}
+        )
 
     # Verify PKCE
     if not verify_code_challenge(code_verifier, code_data["code_challenge"]):
         print(f"❌ PKCE verification failed")
-        raise HTTPException(status_code=400, detail="Invalid code_verifier")
+        return JSONResponse(
+            status_code=400,
+            content={"error": "invalid_grant", "error_description": "Invalid code_verifier"}
+        )
 
     # Verify redirect_uri matches
     if code_data["redirect_uri"] != redirect_uri:
-        raise HTTPException(status_code=400, detail="redirect_uri mismatch")
+        print(f"❌ Redirect URI mismatch: expected {code_data['redirect_uri']}, got {redirect_uri}")
+        return JSONResponse(
+            status_code=400,
+            content={"error": "invalid_grant", "error_description": "redirect_uri mismatch"}
+        )
 
     # Get stored token
     token = code_data.get("token")
     if not token:
-        raise HTTPException(status_code=500, detail="Token not found in authorization code")
+        print(f"❌ Token not found in authorization code")
+        return JSONResponse(
+            status_code=500,
+            content={"error": "server_error", "error_description": "Token not found in authorization code"}
+        )
 
-    print(f"✅ Token exchange successful for user")
+    print(f"✅ Token exchange successful")
+    print(f"📋 Access token: {token[:20]}...")
 
-    # Return OAuth token response
+    # Return OAuth token response (OAuth 2.1 format)
     return JSONResponse(content={
         "access_token": token,
         "token_type": "Bearer",
         "expires_in": 3600,  # 1 hour (adjust based on your token expiry)
         "scope": "brands:read",
+    })
+
+
+# ---------------------------------------------------------------------------
+# Health Check Endpoint
+# ---------------------------------------------------------------------------
+
+@mcp.custom_route(path="/health", methods=["GET"])
+async def health_check(request: Request) -> JSONResponse:
+    """Health check endpoint for monitoring."""
+    # Clean up expired codes on health check (simple cleanup mechanism)
+    cleanup_expired_codes()
+    
+    return JSONResponse(content={
+        "status": "healthy",
+        "service": "Minoan OAuth MCP Server",
+        "timestamp": time.time(),
+        "brands_loaded": len(BRANDS),
+        "active_auth_codes": len(auth_codes),
+        "registered_clients": len(registered_clients),
+        "jwt_secret_configured": bool(JWT_SECRET_KEY),
     })
 
 
@@ -778,6 +989,7 @@ if __name__ == "__main__":
     print(f"📋 OAuth Discovery: {OAUTH_BASE_URL}/.well-known/oauth-authorization-server")
     print(f"🔑 JWKS: {OAUTH_BASE_URL}/.well-known/jwks.json")
     print(f"📝 Client Registration: {OAUTH_BASE_URL}/register (RFC 7591)")
-    print(f"🔐 Authorization Endpoint: {OAUTH_BASE_URL}/auth/login")
+    print(f"🔐 Authorization Endpoint (User Login): {USER_LOGIN_PAGE}")
+    print(f"🔄 OAuth Callback: {OAUTH_BASE_URL}/auth/callback")
     print(f"🎫 Token Endpoint: {OAUTH_BASE_URL}/auth/token")
     mcp.run(transport="http", host="0.0.0.0", port=8000)
