@@ -226,9 +226,100 @@ from fastmcp import FastMCP
 import json
 import os
 import re
+import secrets
+import hashlib
+import base64
+import time
+from datetime import datetime, timedelta
 from difflib import SequenceMatcher
+from fastapi import Request, HTTPException, Query, Form
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
+from starlette.responses import Response
+import httpx
+import jwt
 
 mcp = FastMCP("MinoanBrandDiscovery")
+app = mcp.app  # Access underlying FastAPI app
+
+# ---------------------------------------------------------------------------
+# OAuth Configuration
+# ---------------------------------------------------------------------------
+OAUTH_ISSUER = os.getenv("OAUTH_ISSUER", "https://dev-my.minoan.com")
+OAUTH_BASE_URL = os.getenv("OAUTH_BASE_URL", "http://localhost:8000")
+LOGIN_API_URL = "https://devb2b-api.minoanexperience.com/public/account/login"
+JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "")
+JWT_ALG = "HS256"
+
+# In-memory store for authorization codes (expires after 10 minutes)
+# In production, use Redis or a database
+auth_codes: dict[str, dict] = {}
+
+# ---------------------------------------------------------------------------
+# OAuth Helper Functions
+# ---------------------------------------------------------------------------
+
+def base64url_encode(data: bytes) -> str:
+    """Base64URL encode without padding."""
+    return base64.urlsafe_b64encode(data).decode("utf-8").rstrip("=")
+
+
+def base64url_decode(data: str) -> bytes:
+    """Base64URL decode."""
+    padding = 4 - len(data) % 4
+    if padding != 4:
+        data += "=" * padding
+    return base64.urlsafe_b64decode(data)
+
+
+def generate_code_verifier() -> str:
+    """Generate PKCE code verifier."""
+    return base64url_encode(secrets.token_bytes(32))
+
+
+def generate_code_challenge(verifier: str) -> str:
+    """Generate PKCE code challenge (S256)."""
+    digest = hashlib.sha256(verifier.encode("utf-8")).digest()
+    return base64url_encode(digest)
+
+
+def verify_code_challenge(verifier: str, challenge: str) -> bool:
+    """Verify PKCE code challenge."""
+    expected = generate_code_challenge(verifier)
+    return secrets.compare_digest(expected, challenge)
+
+
+def create_authorization_code(state: str, code_challenge: str, redirect_uri: str) -> str:
+    """Create and store an authorization code."""
+    code = secrets.token_urlsafe(32)
+    auth_codes[code] = {
+        "state": state,
+        "code_challenge": code_challenge,
+        "redirect_uri": redirect_uri,
+        "expires_at": time.time() + 600,  # 10 minutes
+    }
+    print(f"🔐 Created authorization code: {code[:16]}... (expires in 10min)")
+    return code
+
+
+def get_authorization_code(code: str) -> dict | None:
+    """Retrieve and validate authorization code."""
+    if code not in auth_codes:
+        return None
+    data = auth_codes[code]
+    if time.time() > data["expires_at"]:
+        del auth_codes[code]
+        return None
+    return data
+
+
+def consume_authorization_code(code: str) -> dict | None:
+    """Retrieve and delete authorization code (one-time use)."""
+    data = get_authorization_code(code)
+    if data:
+        del auth_codes[code]
+        print(f"✅ Consumed authorization code: {code[:16]}...")
+    return data
+
 
 # ---------------------------------------------------------------------------
 # Load brand data
@@ -319,7 +410,227 @@ def recommend_brands(query: str, max_results: int = 10) -> dict:
     }
 
 # ---------------------------------------------------------------------------
+# OAuth 2.1 + PKCE Endpoints for ChatGPT Integration
+# ---------------------------------------------------------------------------
+
+@app.get("/.well-known/oauth-authorization-server", response_class=JSONResponse)
+async def oauth_authorization_server():
+    """OAuth 2.1 discovery endpoint for ChatGPT."""
+    return {
+        "issuer": OAUTH_ISSUER,
+        "authorization_endpoint": f"{OAUTH_BASE_URL}/auth/login",
+        "token_endpoint": f"{OAUTH_BASE_URL}/auth/token",
+        "jwks_uri": f"{OAUTH_BASE_URL}/.well-known/jwks.json",
+        "code_challenge_methods_supported": ["S256"],
+        "scopes_supported": ["brands:read"],
+        "response_types_supported": ["code"],
+        "grant_types_supported": ["authorization_code"],
+        "token_endpoint_auth_methods_supported": ["none"],  # PKCE only
+    }
+
+
+@app.get("/.well-known/jwks.json", response_class=JSONResponse)
+async def jwks():
+    """
+    JWKS endpoint for public key verification.
+    Note: Since we use HS256 (symmetric), there's no public key.
+    ChatGPT will need JWT_SECRET_KEY for verification, or we'd need to switch to RS256.
+    For now, return an empty keys array with a note.
+    """
+    # For HS256, we can't provide a public key. ChatGPT would need the secret.
+    # If switching to RS256, generate an RSA key pair and return the public key here.
+    return {
+        "keys": []
+        # In production with RS256:
+        # "keys": [{
+        #     "kty": "RSA",
+        #     "kid": "1",
+        #     "use": "sig",
+        #     "n": "...",  # RSA modulus (base64url)
+        #     "e": "AQAB"  # RSA exponent
+        # }]
+    }
+
+
+@app.get("/auth/login", response_class=HTMLResponse)
+async def auth_login(
+    response_type: str = Query(..., description="Must be 'code'"),
+    client_id: str = Query(..., description="OAuth client ID"),
+    redirect_uri: str = Query(..., description="Callback URI"),
+    state: str = Query(..., description="State parameter for CSRF protection"),
+    code_challenge: str = Query(..., description="PKCE code challenge"),
+    code_challenge_method: str = Query("S256", description="PKCE method (S256)"),
+    scope: str = Query("brands:read", description="Requested scopes"),
+):
+    """OAuth authorization endpoint - shows login form."""
+    if response_type != "code":
+        raise HTTPException(status_code=400, detail="response_type must be 'code'")
+    if code_challenge_method != "S256":
+        raise HTTPException(status_code=400, detail="Only S256 code challenge method supported")
+
+    # Store OAuth params in session (simplified - in production use proper sessions)
+    # For now, pass via query params to the form
+
+    html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Minoan Login</title>
+        <style>
+            body {{ font-family: -apple-system, Segoe UI, sans-serif; max-width: 400px; margin: 50px auto; padding: 20px; }}
+            h1 {{ font-size: 24px; margin-bottom: 20px; }}
+            .form-group {{ margin-bottom: 15px; }}
+            label {{ display: block; margin-bottom: 5px; font-size: 14px; color: #555; }}
+            input {{ width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 6px; font-size: 14px; box-sizing: border-box; }}
+            button {{ width: 100%; padding: 12px; background: #111827; color: white; border: none; border-radius: 6px; font-size: 16px; cursor: pointer; }}
+            button:hover {{ background: #1f2937; }}
+            .error {{ color: #dc2626; font-size: 14px; margin-top: 10px; }}
+        </style>
+    </head>
+    <body>
+        <h1>Sign in to Minoan</h1>
+        <form id="loginForm" method="POST" action="/auth/login">
+            <input type="hidden" name="response_type" value="{response_type}">
+            <input type="hidden" name="client_id" value="{client_id}">
+            <input type="hidden" name="redirect_uri" value="{redirect_uri}">
+            <input type="hidden" name="state" value="{state}">
+            <input type="hidden" name="code_challenge" value="{code_challenge}">
+            <input type="hidden" name="code_challenge_method" value="{code_challenge_method}">
+            <input type="hidden" name="scope" value="{scope}">
+            
+            <div class="form-group">
+                <label for="email">Email</label>
+                <input type="email" id="email" name="email" required autofocus>
+            </div>
+            
+            <div class="form-group">
+                <label for="password">Password</label>
+                <input type="password" id="password" name="password" required>
+            </div>
+            
+            <button type="submit">Sign In</button>
+            <div id="error" class="error" style="display: none;"></div>
+        </form>
+        
+        <script>
+            // Form submits normally to allow browser to follow redirect
+            // No need for AJAX - the server returns a 302 redirect
+        </script>
+    </body>
+    </html>
+    """
+    return HTMLResponse(content=html)
+
+
+@app.post("/auth/login")
+async def auth_login_post(
+    response_type: str = Form(...),
+    client_id: str = Form(...),
+    redirect_uri: str = Form(...),
+    state: str = Form(...),
+    code_challenge: str = Form(...),
+    code_challenge_method: str = Form(...),
+    scope: str = Form(...),
+    email: str = Form(...),
+    password: str = Form(...),
+):
+    """Handle login form submission and create authorization code."""
+    print(f"🔐 OAuth login attempt for: {email}")
+
+    # Call the actual login API
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        try:
+            login_resp = await client.post(
+                LOGIN_API_URL,
+                json={"email": email, "password": password},
+                headers={
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                },
+            )
+            login_resp.raise_for_status()
+            login_data = login_resp.json()
+        except httpx.HTTPStatusError as e:
+            print(f"❌ Login failed: {e.response.status_code}")
+            # Return error page or redirect with error
+            error_redirect = f"{redirect_uri}?error=access_denied&error_description=Invalid+email+or+password&state={state}"
+            return RedirectResponse(url=error_redirect, status_code=302)
+        except Exception as e:
+            print(f"❌ Login error: {e}")
+            error_redirect = f"{redirect_uri}?error=server_error&error_description={str(e).replace(' ', '+')}&state={state}"
+            return RedirectResponse(url=error_redirect, status_code=302)
+
+    # Extract token from response
+    token_data = login_data.get("data", {})
+    token = token_data.get("token")
+    if not token:
+        error_redirect = f"{redirect_uri}?error=server_error&error_description=Token+not+found&state={state}"
+        return RedirectResponse(url=error_redirect, status_code=302)
+
+    print(f"✅ Login successful, token extracted: {token[:20]}...")
+
+    # Create authorization code
+    auth_code = create_authorization_code(state, code_challenge, redirect_uri)
+
+    # Store token with the code (for token exchange)
+    auth_codes[auth_code]["token"] = token
+    auth_codes[auth_code]["user_data"] = token_data
+
+    # Redirect to callback with authorization code
+    redirect_url = f"{redirect_uri}?code={auth_code}&state={state}"
+    return RedirectResponse(url=redirect_url, status_code=302)
+
+
+@app.post("/auth/token", response_class=JSONResponse)
+async def auth_token(
+    grant_type: str = Form(...),
+    code: str = Form(...),
+    redirect_uri: str = Form(...),
+    code_verifier: str = Form(..., description="PKCE code verifier"),
+):
+    """OAuth token endpoint - exchanges authorization code for access token."""
+    if grant_type != "authorization_code":
+        raise HTTPException(status_code=400, detail="grant_type must be 'authorization_code'")
+
+    print(f"🔐 Token exchange request for code: {code[:16]}...")
+
+    # Retrieve and validate authorization code
+    code_data = consume_authorization_code(code)
+    if not code_data:
+        raise HTTPException(status_code=400, detail="Invalid or expired authorization code")
+
+    # Verify PKCE
+    if not verify_code_challenge(code_verifier, code_data["code_challenge"]):
+        print(f"❌ PKCE verification failed")
+        raise HTTPException(status_code=400, detail="Invalid code_verifier")
+
+    # Verify redirect_uri matches
+    if code_data["redirect_uri"] != redirect_uri:
+        raise HTTPException(status_code=400, detail="redirect_uri mismatch")
+
+    # Get stored token
+    token = code_data.get("token")
+    if not token:
+        raise HTTPException(status_code=500, detail="Token not found in authorization code")
+
+    print(f"✅ Token exchange successful for user")
+
+    # Return OAuth token response
+    return {
+        "access_token": token,
+        "token_type": "Bearer",
+        "expires_in": 3600,  # 1 hour (adjust based on your token expiry)
+        "scope": "brands:read",
+    }
+
+
+# ---------------------------------------------------------------------------
 # Run MCP server
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
+    print(f"🚀 Starting Minoan OAuth server on http://0.0.0.0:8000")
+    print(f"📋 OAuth Discovery: {OAUTH_BASE_URL}/.well-known/oauth-authorization-server")
+    print(f"🔑 JWKS: {OAUTH_BASE_URL}/.well-known/jwks.json")
+    print(f"🔐 Authorization: {OAUTH_BASE_URL}/auth/login")
+    print(f"🎫 Token: {OAUTH_BASE_URL}/auth/token")
     mcp.run(transport="http", host="0.0.0.0", port=8000)
