@@ -253,12 +253,13 @@ LOGIN_API_URL = "https://devb2b-api.minoanexperience.com/public/account/login"
 JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "")
 JWT_ALG = "HS256"
 
-# Validate critical configuration
+# Note: JWT_SECRET_KEY is optional for basic OAuth flow (tokens are passed through)
+# It's only needed if you want to verify JWT tokens yourself
+# For production, you may want to verify tokens before storing them
 if not JWT_SECRET_KEY:
-    import sys
-    print("❌ ERROR: JWT_SECRET_KEY environment variable is required")
-    print("   Set it with: export JWT_SECRET_KEY='your-secret-key'")
-    sys.exit(1)
+    print("⚠️  WARNING: JWT_SECRET_KEY not set - token verification disabled")
+    print("   Tokens will be passed through without verification")
+    print("   Set JWT_SECRET_KEY if you need to verify tokens")
 
 def get_base_url(request: Request = None) -> str:
     """
